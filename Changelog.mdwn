@@ -1,5 +1,168 @@
 # Changelog
 
+## v1.38.1 - Sat May 2 2026
+
+Maintenance release on top of v1.38.0. No on-disk format changes.
+
+### Linux 7.1 support
+
+The DKMS module now builds against Linux 7.1. Several upstream kernel
+changes broke the previous build:
+
+- `xor_blocks()` → `xor_gen()` (chunking is now handled internally)
+- `bool_names` (fs_parser) is now static; carry our own table
+- `bdev_nonrot()` → `bdev_rot()`
+- `<linux/pagevec.h>` → `<linux/folio_batch.h>`
+
+Older kernels remain supported via version-gated shims.
+
+### Performance
+
+The locking subsystem and btree cache both got significant work.
+
+- SIX locks/cycle detector: The deadlock cycle detector is now significantly
+  faster, fully lockless with no atomic operations or barriers, and we now
+  prioritize the oldest transaction on lock wakeups and deadlock avoidance
+  aborts, significantly improving performance on multithreaded workloads with
+  lock contention.
+- Btree write buffer flushing is now multithreaded
+- The btree node cache saw significant cleanups and refactoring, and now has
+  separate clean and dirty lists, again for improved performance under load.
+- Btree node merging: lookup-side btree node merge attempts are now much less
+  aggressive; this was causing significant btree node cache thrashing on some
+  large filesystems. More performance improvements are on the way.
+- When waiting on a device to have free buckets available, spurious wakeups
+  should be significantly reduced.
+
+### New mount option: `ec_max_data_blocks`
+
+Caps the data-block count of new EC stripes. Lets you keep stripe
+width below the device count when you don't want a full-width
+stripe — useful when the device count is high but you'd rather
+limit the read-amplification cost on stripe reconstruct.
+
+### New: `bcachefs wait-devices`
+
+New command that waits for all devices of a multi-device filesystem
+to be present before exiting. Intended as a `WantedBy=` of a `.mount`
+unit so systemd doesn't try to mount before all members are visible.
+Ships with a `bcachefs-wait-devices@.service` template unit in the
+Debian package.
+
+### Bug fixes
+
+Discard:
+
+- **Per-device discard rewind-advance budget**. The journal-rewind
+  buffer used by the discard worker was sized fs-wide, which meant
+  one device with little need_discard activity could starve the
+  budget for another. Now per-device. Fixes the discard worker
+  iterating but finding nothing (`seen=0`) on multi-device
+  filesystems.
+- Properly flush in-flight discards before finding more.
+- `bch2_discard_one_bucket()` now respects `buckets_nouse`.
+- Sysfs FS-level entry for `OPT_FS+OPT_DEVICE` opts (just `discard`
+  today) is dropped — it had been lying on read and silently
+  no-op'ing on write. The per-device sysfs entries and the
+  mount-time `-o discard=` flag are unchanged.
+
+Recovery / fsck:
+
+- Journal rewind now actually runs on clean filesystems (was a
+  no-op).
+- Fix "Second fsck run was not clean" false positive.
+- Torn-read race in `bch2_sb_update()` fixed (the
+  `bucket_gens_key_wrong` reconstruct_alloc flake).
+
+Reconcile:
+
+- Always flush the btree write buffer when starting a phase.
+- Stop reconcile before disabling `c->writes` on going-RO.
+
+Locking / transactions:
+
+- six_lock: fix wait_fifo leak on grow-race + `-ENOMEM` path.
+- Disable migration when in a transaction (per-CPU state stays
+  stable across the trans).
+- migrate_disable scope narrowed to btree-locked sections (also
+  unblocks suspend on bcachefs).
+
+EC:
+
+- `should_cancel_stripe()` now checks reused-block ptrs.
+- Bounded drain of in-flight stripe commits on going-RO.
+
+Btree:
+
+- Cache cannibalize lock leak in `node_get_noiter`.
+- Memory-alloc error path leak in `bch2_btree_node_mem_alloc()`.
+- `bch2_btree_path_fix_key_modified` re-sorts the iterator after a
+  key modification.
+- `fpunch` no longer deletes multiple extents at a time.
+- Drop stale `BUG_ON` in `bch2_read_retry_nodecode()`.
+
+Other:
+
+- Direct IO read error path fix.
+- Shutdown-specific journal quiesce.
+- `str_hash` repair: missing `traverse()` in `dup_entries` (and a
+  separate one in `repair_key`).
+
+### New: per-device `freelist_wait` counters
+
+Per-device counters for allocator wait events, plus explicit helpers
+to manage them. Gives much better visibility into which device is
+the contention point during allocator stalls.
+
+### Removed: `btree_cache_size_max` mount option
+
+Reverted. This was a workaround capping btree cache size to force
+cannibalization under memory pressure; the btree cache work in this
+release addresses the underlying issue properly. Anyone who set the
+option can drop it.
+
+### Tools
+
+- `bcachefs top` and `bcachefs timestats` got paged, tabbed,
+  scrollable displays. With many devices the per-device tables had
+  been pushing other stats off-screen; pages now grow independently.
+  `timestats` also adds an `e` toggle between lifetime and
+  recent-EWMA views, freeing columns to show frequency mean/stddev.
+  `top` drops the `d` devices toggle (subsumed by the devices page).
+  Keys: Tab/Shift-Tab to switch pages, Up/Down/PageUp/PageDown/Home/End
+  to scroll.
+- `bcachefs migrate` no longer enables reconcile/copygc during
+  migration — data was being moved (and re-checksummed) before the
+  new superblock had been committed.
+- `list_journal -o` now accepts mount options; non-negotiable
+  journal-reading flags are layered over the user's options.
+
+### DKMS / packaging
+
+- DKMS module now builds against Linux 7.x and later (#557).
+- DKMS keeps debug symbols in the installed module — useful for
+  meaningful backtraces in perf/trace output when users hit bugs.
+- musl build fix: use `libc::Ioctl` instead of `libc::c_ulong` for
+  ioctl request constants (#561).
+- APT repository: published-repo instructions corrected, key files
+  now armored `.asc`, CI workflows switched to a binary keyring.
+- Nix flake: instructions for pulling a snapshot version, a
+  `nixosModules` configuration template, rust overlay composed at
+  the flake level, and module-package resolution through overlays
+  (#533).
+
+### Build
+
+- MSRV bumped to Rust 1.85.
+- Userspace `ida_alloc_range`/`ida_free` implementation — `fast_list.c`
+  needed the modern API and the legacy shim was never implemented, so
+  the userspace build was broken as soon as it started compiling that
+  file. Implemented as a d-ary bitmap tree rather than vendoring
+  `lib/idr.c` + `lib/xarray.c`.
+- Various Rust cleanups: `PathBuf` for paths in `device_scan.rs`,
+  `parse_uuid_equals` extraction, `read_super_silent` returns
+  `BchError`.
+
 ## v1.38.0 - Sun Apr 19 2026
 
 bcachefs_metadata_version_need_discard_by_journal_seq
