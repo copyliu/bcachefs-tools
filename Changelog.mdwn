@@ -1,5 +1,24 @@
 # Changelog
 
+## v1.38.2 - Sat May 2 2026
+
+### Build fix
+
+`bdev_rot()` was introduced in Linux 7.0, not 7.1 as the v1.38.1 shim
+assumed — so the DKMS module failed to build on 7.0.x with a
+"redefinition of 'bdev_rot'" error. Shim is now correctly version-gated
+to `< 7.0`.
+
+### Performance: accounting read
+
+Fix an O(N×R) memmove pattern in `accounting_read_mem_fixups`. The pass
+that drops zeroed/invalid entries was iterating reverse and calling
+`darray_remove_item` per drop, which memmoves the tail back on each
+removal. On large multi-device filesystems the replicas table grows
+combinatorially with device count, and many entries come back zero on
+read, so the cost was dominating mount time. Replaced with an in-place
+forward filter — O(N) total. Reported by feedc0de (63-drive array).
+
 ## v1.38.1 - Sat May 2 2026
 
 Maintenance release on top of v1.38.0. No on-disk format changes.
