@@ -523,6 +523,8 @@ fn migrate_superblock(dev_path: &str, sb_offset: u64) -> Result<()> {
     let mut opts: c::bch_opts = Default::default();
     opt_set!(opts, nostart, true as u8);
     opt_set!(opts, sb, sb_offset);
+    opt_set!(opts, reconcile_enabled, false as u8);
+    opt_set!(opts, copygc_enabled, false as u8);
 
     let fs = Fs::open(&[dev_path_pb], opts)
         .map_err(|e| anyhow!("Error opening filesystem: {}", e))?;
