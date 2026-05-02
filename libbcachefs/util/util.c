@@ -301,10 +301,36 @@ int bch2_save_backtrace(bch_stacktrace *stack, struct task_struct *task, unsigne
 #endif
 }
 
+#ifndef __KERNEL__
+#include <dlfcn.h>
+
+/*
+ * Userspace stand-in for the kernel's %pB. dladdr() resolves the
+ * nearest exported symbol and offset; for static symbols stripped
+ * from the dynamic symbol table this falls back to "?". Build
+ * with -rdynamic if you need static symbols too.
+ */
+static void prt_addr_symbol(struct printbuf *out, void *addr)
+{
+	Dl_info info;
+	if (dladdr(addr, &info) && info.dli_sname) {
+		prt_printf(out, "%s+%#tx", info.dli_sname,
+			   (uintptr_t)addr - (uintptr_t)info.dli_saddr);
+	} else {
+		prt_printf(out, "%p", addr);
+	}
+}
+#endif
+
 void bch2_prt_backtrace(struct printbuf *out, bch_stacktrace *stack)
 {
 	darray_for_each(*stack, i) {
+#ifdef __KERNEL__
 		prt_printf(out, "[<0>] %pB", (void *) *i);
+#else
+		prt_str(out, "[<0>] ");
+		prt_addr_symbol(out, (void *) *i);
+#endif
 		prt_newline(out);
 	}
 }
