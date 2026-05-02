@@ -58,6 +58,7 @@ CFLAGS+=-std=gnu11 -O2 -g -MMD -Wall -fPIC			\
 	-DNO_BCACHEFS_FS					\
 	-DCONFIG_DEBUG_FS					\
 	-DCONFIG_UNICODE					\
+	-DCONFIG_STACKTRACE					\
 	-D__SANE_USERSPACE_TYPES__				\
 	$(EXTRA_CFLAGS)
 
@@ -99,7 +100,7 @@ CFLAGS+=$(call cc-disable-warning, enum-conversion)
 CFLAGS+=$(call cc-disable-warning, gnu-variable-sized-type-not-at-end)
 export RUSTFLAGS:=$(RUSTFLAGS) -C default-linker-libraries
 
-PKGCONFIG_LIBS="blkid uuid liburcu libsodium zlib liblz4 libzstd libudev libkeyutils"
+PKGCONFIG_LIBS="blkid uuid liburcu libsodium zlib liblz4 libzstd libudev libkeyutils libunwind"
 CFLAGS+=-DBCACHEFS_FUSE
 
 # Only query pkg-config for targets that compile or do a full install.

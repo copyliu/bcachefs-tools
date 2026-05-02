@@ -14,6 +14,7 @@ fn main() {
     println!("cargo:rustc-link-lib=udev");
     println!("cargo:rustc-link-lib=keyutils");
     println!("cargo:rustc-link-lib=aio");
+    println!("cargo:rustc-link-lib=unwind");
 
     // fuser crate talks to /dev/fuse directly — no libfuse3 needed
 }
