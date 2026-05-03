@@ -341,9 +341,9 @@ inline void bch2_btree_insert_key_leaf(struct btree_trans *trans,
 	u64s_added = (int) bset_u64s(t) - old_u64s;
 
 	if (b->sib_u64s[0] != U16_MAX && live_u64s_added < 0)
-		b->sib_u64s[0] = max(0, (int) b->sib_u64s[0] + live_u64s_added);
+		b->sib_u64s[0] = max(b->nr.live_u64s, (int) b->sib_u64s[0] + live_u64s_added);
 	if (b->sib_u64s[1] != U16_MAX && live_u64s_added < 0)
-		b->sib_u64s[1] = max(0, (int) b->sib_u64s[1] + live_u64s_added);
+		b->sib_u64s[1] = max(b->nr.live_u64s, (int) b->sib_u64s[1] + live_u64s_added);
 
 	if (u64s_added > live_u64s_added &&
 	    bch2_maybe_compact_whiteouts(c, b))
@@ -998,7 +998,7 @@ static int __bch2_trans_commit_error(struct btree_trans *trans, unsigned flags,
 		if (trans_commit_has_extents(trans))
 			flags = btree_update_set_watermark_hipri(flags);
 
-		ret = bch2_btree_split_leaf(trans, i->path, flags);
+		ret = bch2_btree_split_leaf(trans, i->path, i->k->k.u64s, flags);
 		if (!ret && trans->has_interior_updates)
 			return btree_trans_restart(trans,
 					     BCH_ERR_transaction_restart_split_with_interior_updates);
