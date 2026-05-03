@@ -91,7 +91,6 @@ pub extern "C" fn bch2_start_http_lazy() {
 
         match tiny_http::Server::http_unix(std::path::Path::new(&path)) {
             Ok(server) => {
-                eprintln!("bcachefs: debugfs/sysfs available at {}", path);
                 let _ = SOCKET_PATH.set(path);
                 unsafe { libc::atexit(cleanup_socket); }
                 std::thread::spawn(move || http_thread(server));
