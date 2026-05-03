@@ -13,6 +13,7 @@
   keyutils,
   libaio,
   libsodium,
+  libunwind,
   liburcu,
   libuuid,
   lz4,
@@ -59,6 +60,7 @@ let
       keyutils
       libaio
       libsodium
+      libunwind
       liburcu
       libuuid
       lz4
