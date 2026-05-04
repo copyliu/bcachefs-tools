@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -124,6 +124,18 @@ pub struct Cli {
     /// Human-readable units
     #[arg(short, long)]
     human_readable: bool,
+
+    /// One-shot output (no interactive TUI; equivalent to -n 1)
+    #[arg(long)]
+    once: bool,
+
+    /// Number of samples to print, then exit (0 = unlimited / interactive TUI)
+    #[arg(short = 'n', long, default_value = "0")]
+    count: u32,
+
+    /// Delay between samples, in seconds
+    #[arg(short = 'd', long, default_value = "1")]
+    delay: u32,
 
     /// Filesystem path, device, or UUID (default: current directory)
     filesystem: Option<String>,
@@ -320,8 +332,91 @@ fn render(state: &mut TopState, curr: &[u64], dev_io: &[DevIoEntry], stdout: &mu
     Ok(total_rows)
 }
 
-fn run_interactive(handle: BcachefsHandle, human_readable: bool) -> Result<()> {
+/* Print one frame: counters page (rate / total / mount) followed by devices
+ * page (read/s / read / write/s / write). prev_* gives the baseline for
+ * rates; on the first frame the caller passes curr as prev so rates are 0. */
+fn print_frame(
+    curr: &[u64], prev: &[u64], mount: &[u64],
+    dev_io: &[DevIoEntry], prev_dev_io: &HashMap<String, (u64, u64)>,
+    delay: u32, h: bool,
+) {
+    let d = delay as u64;
+
+    println!("counters:");
+    println!("  {:<40} {:>12}   {:>14} {:>14}",
+        "", format!("{}/s", delay), "total", "mount");
+    for c in COUNTERS {
+        let cv = TopState::get_val(curr, c.stable_id);
+        let pv = TopState::get_val(prev, c.stable_id);
+        let mv = TopState::get_val(mount, c.stable_id);
+        let v_mount = cv.wrapping_sub(mv);
+        if v_mount == 0 { continue }
+
+        let v_rate = cv.wrapping_sub(pv);
+        println!("  {:<40} {:>12}/s {:>14} {:>14}",
+            c.name,
+            fmt_counter(v_rate / d, c.is_sectors, h),
+            fmt_counter(cv,         c.is_sectors, h),
+            fmt_counter(v_mount,    c.is_sectors, h));
+    }
+
+    if !dev_io.is_empty() {
+        println!();
+        println!("devices:");
+        println!("  {:<40} {:>14} {:>14} {:>14} {:>14}",
+            "", "read/s", "read", "write/s", "write");
+        for dev in dev_io {
+            let (pr, pw) = prev_dev_io
+                .get(&dev.label)
+                .copied()
+                .unwrap_or((dev.read_bytes, dev.write_bytes));
+            let rate_r = dev.read_bytes.wrapping_sub(pr) / d;
+            let rate_w = dev.write_bytes.wrapping_sub(pw) / d;
+            println!("  {:<40} {:>14} {:>14} {:>14} {:>14}",
+                &dev.label,
+                fmt_bytes(rate_r, h), fmt_bytes(dev.read_bytes,  h),
+                fmt_bytes(rate_w, h), fmt_bytes(dev.write_bytes, h));
+        }
+    }
+}
+
+/* Non-interactive: take an initial sample, then for each of `count` frames
+ * sleep `delay` seconds, take a fresh sample, and print rates against the
+ * previous sample. Total samples taken = count + 1; total frames printed = count. */
+fn run_non_interactive(
+    handle: &BcachefsHandle, human_readable: bool,
+    count: u32, delay: u32,
+) -> Result<()> {
+    let ioctl_fd   = handle.ioctl_fd_raw();
+    let nr_stable  = COUNTERS.iter().map(|c| c.stable_id).max().unwrap_or(0) + 1;
+    let mount_vals = read_counters(ioctl_fd, BCH_IOCTL_QUERY_COUNTERS_MOUNT, nr_stable)?;
+    let sysfs_path = sysfs_path_from_fd(handle.sysfs_fd())?;
+
+    let mut prev_vals   = read_counters(ioctl_fd, 0, nr_stable)?;
+    let mut prev_dev_io: HashMap<String, (u64, u64)> = read_device_io(&sysfs_path)
+        .into_iter()
+        .map(|d| (d.label, (d.read_bytes, d.write_bytes)))
+        .collect();
+
+    for i in 0..count {
+        std::thread::sleep(Duration::from_secs(delay as u64));
+        let curr   = read_counters(ioctl_fd, 0, nr_stable)?;
+        let dev_io = read_device_io(&sysfs_path);
+
+        if i > 0 { println!(); }
+        print_frame(&curr, &prev_vals, &mount_vals, &dev_io, &prev_dev_io, delay, human_readable);
+
+        prev_vals   = curr;
+        prev_dev_io = dev_io.into_iter()
+            .map(|d| (d.label, (d.read_bytes, d.write_bytes)))
+            .collect();
+    }
+    Ok(())
+}
+
+fn run_interactive(handle: BcachefsHandle, human_readable: bool, delay: u32) -> Result<()> {
     let mut state = TopState::new(&handle, human_readable)?;
+    state.interval_secs = delay.max(1);
 
     run_tui(|stdout| loop {
         let curr = read_counters(state.ioctl_fd, 0, state.nr_stable)?;
@@ -388,7 +483,21 @@ fn top(cli: Cli) -> Result<()> {
     let handle = BcachefsHandle::open(fs_arg)
         .with_context(|| format!("opening filesystem '{}'", fs_arg))?;
 
-    run_interactive(handle, cli.human_readable)
+    let delay = cli.delay.max(1);
+
+    /* --once is shorthand for -n 1; if we're not on a TTY default to one
+     * frame so piped output is sane. Otherwise count > 0 means N frames
+     * and exit; count == 0 means run the interactive TUI. */
+    let count = if cli.once { 1 }
+                else if cli.count > 0 { cli.count }
+                else if !io::stdout().is_terminal() { 1 }
+                else { 0 };
+
+    if count > 0 {
+        run_non_interactive(&handle, cli.human_readable, count, delay)
+    } else {
+        run_interactive(handle, cli.human_readable, delay)
+    }
 }
 
 pub const CMD: super::CmdDef = typed_cmd!("top", "Show live performance counters", Cli, top);
