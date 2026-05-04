@@ -297,7 +297,15 @@ struct dentry *debugfs_create_file(const char *name, umode_t mode,
 				   struct dentry *d_parent, void *data,
 				   const struct file_operations *fops)
 {
-	bch2_start_http_lazy();
+	/*
+	 * Only start the http server when an fs is actually being brought
+	 * up. Module-init creates the root "bcachefs" debugfs dir (and the
+	 * closure debug file) with d_parent == NULL; per-fs debugfs creates
+	 * always pass a non-NULL parent. Without this guard every command
+	 * (--help, version, ...) would bind the unix socket.
+	 */
+	if (d_parent)
+		bch2_start_http_lazy();
 
 	if (!d_parent)
 		d_parent = &debugfs_root.d;
