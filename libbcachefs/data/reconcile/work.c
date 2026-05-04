@@ -78,6 +78,8 @@ static u64 reconcile_scan_encode(struct reconcile_scan s)
 		return RECONCILE_SCAN_COOKIE_metadata;
 	case RECONCILE_SCAN_pending:
 		return RECONCILE_SCAN_COOKIE_pending;
+	case RECONCILE_SCAN_stripes:
+		return RECONCILE_SCAN_COOKIE_stripes;
 	case RECONCILE_SCAN_device:
 		return RECONCILE_SCAN_COOKIE_device + s.dev;
 	case RECONCILE_SCAN_inum:
@@ -98,6 +100,8 @@ static struct reconcile_scan reconcile_scan_decode(struct bch_fs *c, u64 v)
 		};
 	if (v == RECONCILE_SCAN_COOKIE_pending)
 		return (struct reconcile_scan) { .type = RECONCILE_SCAN_pending };
+	if (v == RECONCILE_SCAN_COOKIE_stripes)
+		return (struct reconcile_scan) { .type = RECONCILE_SCAN_stripes };
 	if (v == RECONCILE_SCAN_COOKIE_metadata)
 		return (struct reconcile_scan) { .type = RECONCILE_SCAN_metadata };
 	if (v == RECONCILE_SCAN_COOKIE_fs)
@@ -903,10 +907,8 @@ static int do_reconcile_scan_bps(struct moving_context *ctxt,
 				  last_flushed, NULL, bp, ({
 		ctxt->stats->pos = BBPOS(BTREE_ID_backpointers, iter.pos);
 
-		if (kthread_should_stop() || !bch2_reconcile_enabled(c))
-			break;
-
 		CLASS(disk_reservation, res)(c);
+		(kthread_should_stop() || !bch2_reconcile_enabled(c)) ? 1 :
 		do_reconcile_scan_bp(trans, s, bp, last_flushed) ?:
 		bch2_trans_commit(trans, &res.r, NULL, BCH_TRANS_COMMIT_no_enospc);
 	}));
@@ -969,15 +971,13 @@ static int do_reconcile_scan_btree(struct moving_context *ctxt,
 		ctxt->stats->pos = BBPOS(iter.btree_id, iter.pos);
 		bch2_progress_update_iter(trans, &r->progress, &iter);
 
-		if (kthread_should_stop() || !bch2_reconcile_enabled(c))
-			return 0;
-
 		atomic64_add(!level ? k.k->size : c->opts.btree_node_size >> 9,
 			     &r->scan_stats.sectors_seen);
 
 		bch2_disk_reservation_put(c, &res.r);
 
 		struct bch_inode_opts opts;
+		(kthread_should_stop() || !bch2_reconcile_enabled(c)) ? 1 :
 		bch2_bkey_get_io_opts(trans, snapshot_io_opts, k, &opts) ?:
 		update_reconcile_opts_scan(trans, snapshot_io_opts, &opts, &iter, level, k, s) ?:
 		(start.inode &&
@@ -1018,6 +1018,62 @@ static int do_reconcile_scan_fs(struct moving_context *ctxt, struct reconcile_sc
 	return 0;
 }
 
+static int reconcile_scan_stripe_can_widen_one(struct btree_trans *trans,
+					       struct btree_iter *iter,
+					       struct bkey_s_c k,
+					       widen_cache *cache)
+{
+	struct bch_fs *c = trans->c;
+
+	if (k.k->type != KEY_TYPE_stripe)
+		return 0;
+
+	const struct bch_stripe *cur = bkey_s_c_to_stripe(k).v;
+	unsigned nr_devs;
+	try(bch2_widen_cache_lookup(cache, c,
+				    cur->disk_label, le16_to_cpu(cur->sectors),
+				    &nr_devs));
+
+	u8 new_can_widen = stripe_widen_value(
+		stripe_widen_target_nr_data(nr_devs, cur->nr_redundant),
+		cur->nr_blocks - cur->nr_redundant);
+
+	if (cur->can_widen == new_can_widen)
+		return 0;
+
+	struct bkey_i_stripe *update =
+		errptr_try(bch2_bkey_make_mut_typed(trans, iter, &k, 0, stripe));
+	update->v.can_widen = new_can_widen;
+	return 0;
+}
+
+static int do_reconcile_scan_stripes(struct moving_context *ctxt)
+{
+	struct btree_trans *trans = ctxt->trans;
+	struct bch_fs *c = trans->c;
+	struct bch_fs_reconcile *r = &c->reconcile;
+
+	CLASS(widen_cache, cache)();
+	try(bch2_widen_cache_init(&cache));
+
+	bch2_progress_init(&r->progress, NULL, c, BIT_ULL(BTREE_ID_stripes), 0);
+	r->scan_start	= BBPOS(BTREE_ID_stripes, POS_MIN);
+	r->scan_end	= BBPOS(BTREE_ID_stripes, SPOS_MAX);
+
+	return for_each_btree_key_commit(trans, iter, BTREE_ID_stripes,
+			POS_MIN, BTREE_ITER_prefetch, k,
+			NULL, NULL, BCH_TRANS_COMMIT_no_enospc, ({
+		ctxt->stats->pos = BBPOS(iter.btree_id, iter.pos);
+		bch2_progress_update_iter(trans, &r->progress, &iter);
+
+		atomic64_add(c->opts.btree_node_size >> 9,
+			     &r->scan_stats.sectors_seen);
+
+		(kthread_should_stop() || !bch2_reconcile_enabled(c)) ? 1 :
+		reconcile_scan_stripe_can_widen_one(trans, &iter, k, &cache);
+	}));
+}
+
 noinline_for_stack
 static int do_reconcile_scan(struct moving_context *ctxt,
 			     struct per_snapshot_io_opts *snapshot_io_opts,
@@ -1038,6 +1094,8 @@ static int do_reconcile_scan(struct moving_context *ctxt,
 		try(do_reconcile_scan_fs(ctxt, s, snapshot_io_opts, true));
 	} else if (s.type == RECONCILE_SCAN_device) {
 		try(do_reconcile_scan_bps(ctxt, s, last_flushed));
+	} else if (s.type == RECONCILE_SCAN_stripes) {
+		try(do_reconcile_scan_stripes(ctxt));
 	} else if (s.type == RECONCILE_SCAN_inum) {
 		r->scan_start	= BBPOS(BTREE_ID_extents, POS(s.inum, 0));
 		r->scan_end	= BBPOS(BTREE_ID_extents, POS(s.inum, U64_MAX));

@@ -779,9 +779,9 @@ static unsigned pick_blocksize(struct bch_fs *c,
 }
 
 /* returns blocksize */
-static unsigned disk_label_ec_devs(struct bch_fs *c, unsigned disk_label,
-				   struct bch_devs_mask *devs,
-				   unsigned blocksize)
+unsigned bch2_disk_label_ec_devs(struct bch_fs *c, unsigned disk_label,
+				 struct bch_devs_mask *devs,
+				 unsigned blocksize)
 {
 	guard(rcu)();
 
@@ -799,6 +799,68 @@ static unsigned disk_label_ec_devs(struct bch_fs *c, unsigned disk_label,
 		if (ca->mi.bucket_size != blocksize)
 			__clear_bit(ca->dev_idx, devs->d);
 	return blocksize;
+}
+
+/*
+ * RW-member view of bch2_disk_label_ec_devs: returns devs in this disk_label
+ * group whose configured state is BCH_MEMBER_STATE_rw, regardless of whether
+ * they're currently online. This is the target for stripe.can_widen so that
+ * transient online/offline transitions don't trigger a full reconcile scan
+ * to rewrite can_widen across every stripe.
+ */
+void bch2_disk_label_ec_rw_member_devs(struct bch_fs *c, unsigned disk_label,
+				       struct bch_devs_mask *devs,
+				       unsigned blocksize)
+{
+	guard(rcu)();
+
+	const struct bch_devs_mask *t = disk_label
+		? bch2_target_to_mask(c, group_to_target(disk_label - 1))
+		: NULL;
+
+	memset(devs, 0, sizeof(*devs));
+	for_each_member_device_rcu(c, ca, t)
+		if (ca->mi.state == BCH_MEMBER_STATE_rw &&
+		    (ca->mi.data_allowed & BIT(BCH_DATA_user)) &&
+		    ca->mi.durability &&
+		    ca->mi.bucket_size == blocksize)
+			__set_bit(ca->dev_idx, devs->d);
+}
+
+static int widen_cache_cmp(const void *_l, const void *_r)
+{
+	const struct widen_cache_entry *l = _l, *r = _r;
+	return cmp_int(l->disk_label, r->disk_label) ?:
+	       cmp_int(l->sectors, r->sectors);
+}
+
+int bch2_widen_cache_init(widen_cache *cache)
+{
+	/* eytzinger1 reserves slot 0 as a sentinel: */
+	return darray_push(cache, ((struct widen_cache_entry) {}));
+}
+
+int bch2_widen_cache_lookup(widen_cache *cache, struct bch_fs *c,
+			    u8 disk_label, u16 sectors,
+			    unsigned *nr_devs)
+{
+	struct widen_cache_entry search = {
+		.disk_label	= disk_label,
+		.sectors	= sectors,
+	};
+	struct widen_cache_entry *e =
+		darray_eytzinger1_find(*cache, widen_cache_cmp, &search);
+	if (!e) {
+		struct bch_devs_mask devs;
+		bch2_disk_label_ec_rw_member_devs(c, disk_label, &devs, sectors);
+		search.nr_devs = dev_mask_nr(&devs);
+		try(darray_push(cache, search));
+		darray_eytzinger1_sort(*cache, widen_cache_cmp);
+		e = darray_eytzinger1_find(*cache, widen_cache_cmp, &search);
+	}
+
+	*nr_devs = e->nr_devs;
+	return 0;
 }
 
 static void ec_stripe_key_init(struct bch_fs *c,
@@ -1141,6 +1203,31 @@ static int get_old_stripe(struct btree_trans *trans,
 			: 0;
 	}
 
+	/*
+	 * Demote can_widen if the RW-member set for this disk_label has shrunk
+	 * since the last reconcile_scan_stripes pass: a stale-high value would
+	 * keep a non-widenable stripe at the top of the LRU, blocking real
+	 * candidates. We only demote here - promotions (devs added or going RW)
+	 * are handled by reconcile_scan_stripes. Computed against RW members
+	 * (regardless of online state) to match the scan's view; transient
+	 * online/offline transitions don't churn can_widen on every stripe.
+	 */
+	struct bch_devs_mask rw_member_devs;
+	bch2_disk_label_ec_rw_member_devs(c, old.v->disk_label, &rw_member_devs,
+					  le16_to_cpu(old.v->sectors));
+	u8 correct_can_widen = stripe_widen_value(
+		stripe_widen_target_nr_data(dev_mask_nr(&rw_member_devs),
+					    old.v->nr_redundant),
+		old.v->nr_blocks - old.v->nr_redundant);
+
+	if (old.v->can_widen > correct_can_widen) {
+		struct bkey_i_stripe *upd =
+			errptr_try(bch2_bkey_make_mut_typed(trans, &iter, &k, 0, stripe));
+		upd->v.can_widen = correct_can_widen;
+		return bch2_trans_commit(trans, NULL, NULL, BCH_TRANS_COMMIT_no_enospc) ?:
+		       bch_err_throw(c, transaction_restart_commit);
+	}
+
 	bool ret = may_reuse_stripe(c, new, old.v) &&
 		bch2_stripe_handle_tryget(c, &new->old_stripe_handle, idx);
 	if (ret)
@@ -1404,7 +1491,7 @@ static void ec_stripe_head_devs_update(struct bch_fs *c, struct ec_stripe_head *
 {
 	struct bch_devs_mask old_devs = h->devs;
 
-	h->blocksize		= disk_label_ec_devs(c, h->disk_label, &h->devs, 0);
+	h->blocksize		= bch2_disk_label_ec_devs(c, h->disk_label, &h->devs, 0);
 	h->nr_active_devs	= dev_mask_nr(&h->devs);
 
 	/*
@@ -1663,7 +1750,7 @@ int bch2_stripe_repair(struct moving_context *ctxt,
 		return 0;
 
 	struct bch_devs_mask devs;
-	disk_label_ec_devs(c, old_s->disk_label, &devs, le16_to_cpu(old_s->sectors));
+	bch2_disk_label_ec_devs(c, old_s->disk_label, &devs, le16_to_cpu(old_s->sectors));
 
 	unsigned need_evacuate = max(0,
 			(int) (nr_live_data_blocks + old_s->nr_redundant) - (int) dev_mask_nr(&devs));

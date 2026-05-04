@@ -211,4 +211,29 @@ static inline bool bitmap_empty(const unsigned long *src, unsigned nbits)
 	return find_first_bit(src, nbits) == nbits;
 }
 
+static inline bool __bitmap_equal(const unsigned long *bitmap1,
+				  const unsigned long *bitmap2, unsigned int bits)
+{
+	unsigned int k, lim = bits / BITS_PER_LONG;
+
+	for (k = 0; k < lim; k++)
+		if (bitmap1[k] != bitmap2[k])
+			return false;
+
+	if (bits % BITS_PER_LONG)
+		if ((bitmap1[k] ^ bitmap2[k]) & BITMAP_LAST_WORD_MASK(bits))
+			return false;
+
+	return true;
+}
+
+static inline bool bitmap_equal(const unsigned long *src1,
+				const unsigned long *src2,
+				unsigned int nbits)
+{
+	if (small_const_nbits(nbits))
+		return !((*src1 ^ *src2) & BITMAP_LAST_WORD_MASK(nbits));
+	return __bitmap_equal(src1, src2, nbits);
+}
+
 #endif /* _PERF_BITOPS_H */

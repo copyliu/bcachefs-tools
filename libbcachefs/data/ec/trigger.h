@@ -88,6 +88,24 @@ static inline void stripe_csum_set(struct bch_stripe *s,
 	memcpy(stripe_csum(s, block, csum_idx), &csum, bch_crc_bytes[s->csum_type]);
 }
 
+/*
+ * Pool widening target: how many data blocks the current device pool
+ * could supply to a stripe with this much parity overhead. Capped at
+ * BCH_BKEY_PTRS_MAX.
+ */
+static inline unsigned stripe_widen_target_nr_data(unsigned nr_devs, unsigned nr_redundant)
+{
+	return nr_devs > nr_redundant
+		? min_t(unsigned, nr_devs, BCH_BKEY_PTRS_MAX) - nr_redundant
+		: 0;
+}
+
+/* The clamped (target - actual) delta to store in bch_stripe.can_widen. */
+static inline u8 stripe_widen_value(unsigned target_nr_data, unsigned actual_nr_data)
+{
+	return clamp_t(int, (int)target_nr_data - (int)actual_nr_data, 0, 7);
+}
+
 #define STRIPE_LRU_POS_EMPTY	1
 
 static inline u64 stripe_lru_pos(const struct bch_stripe *s)
@@ -104,11 +122,18 @@ static inline u64 stripe_lru_pos(const struct bch_stripe *s)
 	if (blocks_empty == nr_data)
 		return STRIPE_LRU_POS_EMPTY;
 
-	if (!blocks_empty)
+	/*
+	 * Score by total reusable capacity: empty data slots we can pack
+	 * fresh data into, plus can_widen blocks we can grow into when
+	 * reusing this stripe at a wider target geometry. More = picked
+	 * for reuse first.
+	 */
+	unsigned reusable = blocks_empty + s->can_widen;
+	if (!reusable)
 		return 0;
 
-	/* invert: more blocks empty = reuse first */
-	return LRU_TIME_MAX - blocks_empty;
+	/* invert: more reusable = reuse first */
+	return LRU_TIME_MAX - reusable;
 }
 
 static inline bool __bch2_ptr_matches_stripe(const struct bch_extent_ptr *stripe_ptr,

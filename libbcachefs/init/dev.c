@@ -836,6 +836,18 @@ int __bch2_dev_set_state(struct bch_fs *c, struct bch_dev *ca,
 	if (new_state == BCH_MEMBER_STATE_rw && bch2_dev_is_online(ca))
 		__bch2_dev_read_write(c, ca);
 
+	/*
+	 * Going-RW grows the EC widening target (RW members) for this
+	 * disk_label; queue a stripes scan so can_widen is refreshed and the
+	 * reuse path can pick up newly-widenable stripes. Must come after the
+	 * SB write above so the scan, which reads ca->mi.state, sees the new
+	 * state. Going-from-RW shrinks the target instead, but get_old_stripe
+	 * demotes lazily on the reuse path so we don't need a scan there.
+	 */
+	if (new_state == BCH_MEMBER_STATE_rw)
+		try(bch2_set_reconcile_needs_scan(c,
+			(struct reconcile_scan) { .type = RECONCILE_SCAN_stripes }, false));
+
 	if (do_reconcile_scan)
 		try(bch2_set_reconcile_needs_scan(c, s, true));
 
