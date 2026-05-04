@@ -20,11 +20,15 @@
 
 #include "journal/reclaim.h"
 
-static void bch2_btree_complete_write(struct bch_fs *c, struct btree *b,
-				      struct btree_write *w)
+static void __btree_node_write_done(struct bch_fs *c, struct btree *b)
 {
+	struct btree_write *w = btree_prev_write(b);
 	unsigned long old, new;
+	unsigned type = 0;
 
+	/* If this was the first write to a btree node, signal to the interior
+	 * update that the write is complete:
+	 */
 	old = READ_ONCE(b->will_make_reachable);
 	do {
 		new = old;
@@ -38,18 +42,6 @@ static void bch2_btree_complete_write(struct bch_fs *c, struct btree *b,
 		closure_put(&((struct btree_update *) new)->cl);
 
 	bch2_journal_pin_drop(&c->journal, &w->journal);
-}
-
-static void __btree_node_write_done(struct bch_fs *c, struct btree *b, u64 start_time)
-{
-	struct btree_write *w = btree_prev_write(b);
-	unsigned long old, new;
-	unsigned type = 0;
-
-	bch2_btree_complete_write(c, b, w);
-
-	if (start_time)
-		bch2_time_stats_update(&c->times[BCH_TIME_btree_node_write], start_time);
 
 	old = READ_ONCE(b->flags);
 	do {
@@ -77,7 +69,7 @@ static void __btree_node_write_done(struct bch_fs *c, struct btree *b, u64 start
 
 	if (new & (1U << BTREE_NODE_write_in_flight)) {
 		/* Re-arm: bit stays set across the new write, no counter change. */
-		__bch2_btree_node_write(c, b, BTREE_WRITE_ALREADY_STARTED|type);
+		__bch2_btree_node_write(c, b, BTREE_WRITE_already_started|type);
 	} else {
 		atomic_long_dec(&c->btree.cache.nr_in_flight);
 		bch2_btree_node_write_done_clean(c, b);
@@ -131,7 +123,6 @@ static void btree_node_write_work(struct work_struct *work)
 		container_of(work, struct btree_write_bio, work);
 	struct bch_fs *c	= wbio->wbio.c;
 	struct btree *b		= wbio->wbio.bio.bi_private;
-	u64 start_time		= wbio->start_time;
 
 	CLASS(btree_trans, trans)(c);
 
@@ -175,6 +166,7 @@ static void btree_node_write_work(struct work_struct *work)
 		}
 	}
 
+	bch2_time_stats_update(&c->times[BCH_TIME_btree_node_write], wbio->start_time);
 	async_object_list_del(c, btree_write_bio, wbio->list_idx);
 	bio_put(&wbio->wbio.bio);
 
@@ -182,7 +174,7 @@ static void btree_node_write_work(struct work_struct *work)
 		btree_path_idx_t path_idx;
 		int ret = bch2_btree_node_lock_with_path(trans, &b->c, SIX_LOCK_read, &path_idx);
 		if (!ret) {
-			__btree_node_write_done(c, b, start_time);
+			__btree_node_write_done(c, b);
 			bch2_btree_node_unlock_with_path(trans, path_idx, b->c.level);
 		}
 		ret;
@@ -228,6 +220,9 @@ static void btree_node_write_endio(struct bio *bio)
 		wb->data_bytes,
 		wb->wbio.used_mempool,
 		wb->data);
+
+	atomic_long_dec(&c->btree.cache.nr_in_flight_inner);
+	closure_wake_up(&c->btree.cache.nr_in_flight_wait);
 
 	clear_btree_node_write_in_flight_inner(b);
 	smp_mb__after_atomic();
@@ -294,7 +289,7 @@ void __bch2_btree_node_write(struct bch_fs *c, struct btree *b, unsigned flags)
 	u64 start_time = local_clock();
 	int ret;
 
-	if (flags & BTREE_WRITE_ALREADY_STARTED)
+	if (flags & BTREE_WRITE_already_started)
 		goto do_write;
 
 	/*
@@ -311,7 +306,7 @@ void __bch2_btree_node_write(struct bch_fs *c, struct btree *b, unsigned flags)
 		if (!(old & (1 << BTREE_NODE_dirty)))
 			return;
 
-		if ((flags & BTREE_WRITE_ONLY_IF_NEED) &&
+		if ((flags & BTREE_WRITE_only_if_need) &&
 		    !(old & (1 << BTREE_NODE_need_write)))
 			return;
 
@@ -327,7 +322,7 @@ void __bch2_btree_node_write(struct bch_fs *c, struct btree *b, unsigned flags)
 		if (old & (1 << BTREE_NODE_write_in_flight))
 			return;
 
-		if (flags & BTREE_WRITE_ONLY_IF_NEED)
+		if (flags & BTREE_WRITE_only_if_need)
 			type = new & BTREE_WRITE_TYPE_MASK;
 		new &= ~BTREE_WRITE_TYPE_MASK;
 
@@ -533,6 +528,8 @@ do_write:
 
 	async_object_list_add(c, btree_write_bio, wbio, &wbio->list_idx);
 
+	atomic_long_inc(&c->btree.cache.nr_in_flight_inner);
+
 	INIT_WORK(&wbio->work, btree_write_submit);
 	queue_work(c->btree.write_submit_wq, &wbio->work);
 	return;
@@ -541,7 +538,7 @@ err:
 	b->written += sectors_to_write;
 nowrite:
 	bch2_btree_bounce_free(c, bytes, used_mempool, data);
-	__btree_node_write_done(c, b, 0);
+	__btree_node_write_done(c, b);
 }
 
 /*
@@ -595,35 +592,6 @@ bool bch2_btree_post_write_cleanup(struct bch_fs *c, struct btree *b)
 	bch2_btree_build_aux_trees(b);
 
 	return invalidated_iter;
-}
-
-/*
- * Use this one if the node is intent locked:
- */
-void bch2_btree_node_write(struct bch_fs *c, struct btree *b,
-			   enum six_lock_type lock_type_held,
-			   unsigned flags)
-{
-	if (lock_type_held == SIX_LOCK_intent ||
-	    (lock_type_held == SIX_LOCK_read &&
-	     six_lock_tryupgrade(&b->c.lock))) {
-		__bch2_btree_node_write(c, b, flags);
-
-		/* don't cycle lock unnecessarily: */
-		if (btree_node_just_written(b) &&
-		    six_trylock_write(&b->c.lock)) {
-			bch2_btree_post_write_cleanup(c, b);
-			six_unlock_write(&b->c.lock);
-		}
-
-		if (lock_type_held == SIX_LOCK_read)
-			six_lock_downgrade(&b->c.lock);
-	} else {
-		__bch2_btree_node_write(c, b, flags);
-		if (lock_type_held == SIX_LOCK_write &&
-		    btree_node_just_written(b))
-			bch2_btree_post_write_cleanup(c, b);
-	}
 }
 
 void bch2_btree_node_write_trans(struct btree_trans *trans, struct btree *b,
