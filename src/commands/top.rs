@@ -222,7 +222,7 @@ fn build_frame(state: &TopState, curr: &[u64], dev_io: &[DevIoEntry])
     let mut row = 0usize;
 
     lines.push("All counters have a corresponding tracepoint; for more info on any given event, try e.g.".into());
-    lines.push("  perf trace -e bcachefs:data_update_pred".into());
+    lines.push("  trace-cmd stream -e bcachefs:data_update_pred".into());
     lines.push(String::new());
     lines.push("  q:quit  h:human-readable  Tab:page  \u{2191}\u{2193}:scroll  PgUp/PgDn  1-9:interval".into());
 
