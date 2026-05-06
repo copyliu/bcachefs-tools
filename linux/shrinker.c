@@ -7,6 +7,7 @@
 #include <linux/list.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
+#include <linux/percpu.h>
 #include <linux/shrinker.h>
 
 #include "tools-util.h"
@@ -126,6 +127,7 @@ void linux_shrinkers_init(void)
 {
 	rcu_init();
 	rcu_register_thread();
+	bch_percpu_thread_init();
 
 	blkdev_init();
 

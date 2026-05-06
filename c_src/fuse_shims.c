@@ -48,6 +48,7 @@ void rust_fuse_ensure_current(void)
 void rust_fuse_rcu_register(void)
 {
 	rcu_register_thread();
+	bch_percpu_thread_init();
 }
 
 void rust_fuse_rcu_unregister(void)

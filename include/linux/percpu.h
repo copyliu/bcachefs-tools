@@ -19,9 +19,50 @@
 
 #define __verify_pcpu_ptr(ptr)
 
-#define per_cpu_ptr(ptr, cpu)	(ptr)
-#define raw_cpu_ptr(ptr)	(ptr)
-#define this_cpu_ptr(ptr)	raw_cpu_ptr(ptr)
+/*
+ * Static per-CPU variables: DEFINE_PER_CPU() places the variable in a custom
+ * linker section "bch_percpu". Each thread gets a private chunk of size
+ * (__stop_bch_percpu - __start_bch_percpu), pointed at by a TLS pointer; the
+ * variable's address in the section is its offset within the chunk.
+ *
+ * Cross-thread access (per_cpu_ptr(p, cpu)) goes through a global registry
+ * of chunk pointers. alloc_percpu()-allocated memory is a regular heap pointer
+ * outside the section range, so the macros pass it through unchanged for now
+ * — phase 2 will fold dynamic percpu into the same chunk model.
+ */
+extern char __start_bch_percpu[], __stop_bch_percpu[];
+
+#define DEFINE_PER_CPU(type, name)					\
+	__attribute__((section("bch_percpu"))) type name
+
+#define DECLARE_PER_CPU(type, name)	extern type name
+
+#define BCH_PERCPU_MAX_CPUS	256
+
+extern __thread void *bch_percpu_my_chunk;
+extern __thread int   bch_percpu_my_id;
+extern void *bch_percpu_chunks[BCH_PERCPU_MAX_CPUS];
+extern int   bch_percpu_nr_cpus;
+
+void bch_percpu_thread_init(void);
+void bch_percpu_register(void (*init_one)(void *), void (*exit_one)(void *),
+			 void *pcv);
+
+static inline void *__bch_percpu_resolve(void *p, void *chunk)
+{
+	char *cp = (char *)p;
+	if (cp >= __start_bch_percpu && cp < __stop_bch_percpu)
+		return (char *)chunk + (cp - __start_bch_percpu);
+	return p;	/* alloc_percpu pass-through */
+}
+
+#define this_cpu_ptr(ptr)						\
+	((typeof(ptr))__bch_percpu_resolve((void *)(ptr), bch_percpu_my_chunk))
+
+#define per_cpu_ptr(ptr, cpu)						\
+	((typeof(ptr))__bch_percpu_resolve((void *)(ptr), bch_percpu_chunks[cpu]))
+
+#define raw_cpu_ptr(ptr)	this_cpu_ptr(ptr)
 
 #define __pcpu_size_call_return(stem, variable)				\
 ({									\

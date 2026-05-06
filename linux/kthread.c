@@ -4,6 +4,7 @@
 
 #include <linux/bitops.h>
 #include <linux/kthread.h>
+#include <linux/percpu.h>
 #include <linux/rcupdate.h>
 #include <linux/sched.h>
 
@@ -19,6 +20,7 @@ enum KTHREAD_BITS {
 static void *kthread_start_fn(void *data)
 {
 	rcu_register_thread();
+	bch_percpu_thread_init();
 
 	current = data;
 	schedule();
