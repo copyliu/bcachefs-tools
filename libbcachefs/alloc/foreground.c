@@ -1767,7 +1767,7 @@ static noinline void bch2_print_allocator_stuck(struct bch_fs *c, struct alloc_r
 		prt_printf(&buf, "will_retry_all_devices:\t%u\n", req->will_retry_all_devices);
 		prt_printf(&buf, "will_retry_target_devices:\t%u\n", req->will_retry_target_devices);
 		prt_printf(&buf, "will_retry_set_devices:\t%u\n", req->will_retry_set_devices);
-		prt_printf(&buf, "copygc_can_make_progress :\t%u\n", req->copygc_can_make_progress);
+		prt_printf(&buf, "copygc_can_make_progress:\t%u\n", req->copygc_can_make_progress);
 		prt_printf(&buf, "have_cl:\t%u\n", req->cl != NULL);
 
 		if (req->devs_have && req->devs_have->nr) {
@@ -1851,15 +1851,6 @@ static noinline void bch2_print_allocator_stuck(struct bch_fs *c, struct alloc_r
 	bch2_print_str(c, KERN_ERR, buf.buf);
 }
 
-static inline unsigned allocator_wait_timeout(struct bch_fs *c)
-{
-	if (c->allocator.last_stuck &&
-	    time_after(c->allocator.last_stuck + HZ * 60 * 2, jiffies))
-		return 0;
-
-	return c->opts.allocator_stuck_timeout * HZ;
-}
-
 /*
  * Returns true if any device we tried to allocate from and failed has had
  * its alloc_wake_counter advance since we recorded the snapshot — i.e. the
@@ -1882,33 +1873,60 @@ static bool alloc_wait_advanced(struct bch_fs *c, struct alloc_request *req)
 		/* If a device has been removed, retry the allocation now */
 
 		struct bch_dev *ca = bch2_dev_rcu_noerror(c, e->dev);
-		if (!ca ||
-		    (atomic_read(&ca->alloc_wake_counter) !=
-		     e->wake_counter_snapshot)) {
+		if (!ca)
+			return true;
+		if (atomic_read(&ca->alloc_wake_counter) !=
+		    e->wake_counter_snapshot) {
 			bch2_dev_usage_read_fast(ca, &req->usage);
-			if (__dev_buckets_free(ca, req->usage, req->watermark) > 1)
+			if (__dev_buckets_free(ca, req->usage, req->watermark) > 1 ||
+			    !bch2_copygc_can_make_progress(ca))
 				return true;
+
+			bch2_copygc_wakeup(c);
 		}
 	}
 	BUG_ON(!found);
 	return false;
 }
 
-void __bch2_wait_on_allocator(struct bch_fs *c, struct alloc_request *req,
+void __bch2_wait_on_allocator(struct btree_trans *trans, struct bch_fs *c,
+			      struct alloc_request *req,
 			      int err, struct closure *cl)
 {
-	unsigned long until = jiffies + allocator_wait_timeout(c);
+	unsigned long until = jiffies + c->opts.allocator_stuck_timeout * HZ;
+
+	if (trans)
+		bch2_trans_unlock(trans);
 
 	while (1) {
-		unsigned long t = until - jiffies;
+		long t = until - jiffies;
 
-		if (t && closure_sync_timeout(cl, t)) {
-			/* Timed out — cl is still on freelist_wait. */
-			c->allocator.last_stuck = jiffies;
-			bch2_print_allocator_stuck(c, req, err);
+		if (t > 0 && trans_closure_sync_timeout(trans, cl, t)) {
+			/*
+			 * Timed out — cl is still on freelist_wait.
+			 *
+			 * Multiple threads can be waiting on the allocator
+			 * concurrently; without this CAS gate they would all
+			 * race past the timeout and dump fs state at once,
+			 * interleaving N copies of the same output.
+			 */
+			unsigned long old = READ_ONCE(c->allocator.last_stuck);
+
+			if ((!old || time_after(jiffies, old + HZ * 60 * 2)) &&
+			    try_cmpxchg(&c->allocator.last_stuck, &old, jiffies))
+				bch2_print_allocator_stuck(c, req, err);
 		}
 
-		closure_sync(cl);
+		trans_closure_sync(trans, cl);
+
+		/*
+		 * If we're going emergency-RO, bail out: alloc_wait_advanced
+		 * gates on __dev_buckets_free > 1, which won't be true if
+		 * we're shutting down with a draining device — we'd re-park
+		 * and block read_only_work indefinitely.
+		 */
+		if (test_bit(BCH_FS_emergency_ro, &c->flags))
+			return;
 
 		if (!bch2_err_matches(err, BCH_ERR_bucket_alloc_blocked))
 			return;

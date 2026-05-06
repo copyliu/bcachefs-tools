@@ -768,7 +768,7 @@ static int btree_update_nodes_written_trans(struct btree_trans *trans,
 		}
 
 		try(bch2_key_trigger_new(trans, as->btree_id, i->level + 1, bkey_i_to_s(&i->key),
-					 BTREE_TRIGGER_transactional));
+					 BKEY_BTREE_PTR_U64s_MAX, BTREE_TRIGGER_transactional));
 
 		if (!i->update_node_key || i->root) {
 			journal_entry_set(errptr_try(bch2_trans_jset_entry_alloc(trans,
@@ -1402,8 +1402,7 @@ bch2_btree_update_start(struct btree_trans *trans, struct btree_path *path,
 			ret = bch2_btree_reserve_get(trans, as, nr_nodes, req);
 			if (!bch2_err_matches(ret, BCH_ERR_operation_blocked))
 				break;
-			bch2_trans_unlock(trans);
-			bch2_wait_on_allocator(c, req, ret, &cl);
+			bch2_wait_on_allocator(trans, c, req, ret, &cl);
 		} while (1);
 
 		/*
@@ -3350,15 +3349,21 @@ static int __bch2_btree_node_update_key(struct btree_trans *trans,
 							    BTREE_ITER_intent);
 
 			try(bch2_btree_iter_traverse(&parent_iter));
-			try(bch2_trans_update(trans, &parent_iter, new_key, skip_triggers ? BTREE_TRIGGER_norun : 0));
+			try(bch2_trans_update_buf(trans, &parent_iter, new_key,
+						  BKEY_BTREE_PTR_U64s_MAX,
+						  skip_triggers ? BTREE_TRIGGER_norun : 0));
 		} else {
 			if (!skip_triggers)
-				try(bch2_key_trigger(trans, b->c.btree_id, b->c.level + 1,
-						     bkey_i_to_s_c(&b->key),
-						     bkey_i_to_s(new_key),
-						     BTREE_TRIGGER_insert|
-						     BTREE_TRIGGER_overwrite|
-						     BTREE_TRIGGER_transactional));
+				try(bch2_key_trigger(trans, (struct btree_trigger_op) {
+					.btree		= b->c.btree_id,
+					.level		= b->c.level + 1,
+					.old		= bkey_i_to_s_c(&b->key),
+					.new		= bkey_i_to_s(new_key),
+					.new_buf_u64s	= BKEY_BTREE_PTR_U64s_MAX,
+					.flags		= BTREE_TRIGGER_insert|
+							  BTREE_TRIGGER_overwrite|
+							  BTREE_TRIGGER_transactional,
+				}));
 
 			journal_entry_set(errptr_try(bch2_trans_jset_entry_alloc(trans,
 										 jset_u64s(b->key.k.u64s))),

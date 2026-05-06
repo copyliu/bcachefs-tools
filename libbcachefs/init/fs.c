@@ -20,6 +20,7 @@
 #include "btree/init.h"
 #include "btree/interior.h"
 #include "btree/key_cache.h"
+#include "btree/locking.h"
 #include "btree/read.h"
 #include "btree/write.h"
 #include "btree/write_buffer.h"
@@ -501,6 +502,13 @@ static bool __bch2_fs_emergency_read_only(struct bch_fs *c, struct printbuf *out
 		bch2_journal_halt_locked(&c->journal);
 	bch2_fs_read_only_async(c);
 	wake_up(&bch2_read_only_wait);
+
+	/*
+	 * Wake threads parked in __bch2_wait_on_allocator: going-RO won't
+	 * complete while they hold open closures on freelist_wait, and they
+	 * won't otherwise notice the fs is shutting down.
+	 */
+	bch2_alloc_wake_all(c);
 
 	if (ret) {
 		prt_printf(out, "emergency read only at seq %llu\n",
@@ -1669,6 +1677,7 @@ static void bcachefs_exit(void)
 	bch2_vfs_exit();
 	bch2_chardev_exit();
 	bch2_btree_key_cache_exit();
+	bch2_lock_graph_exit();
 	kobject_put(&bcachefs_kobj);
 }
 
@@ -1679,6 +1688,7 @@ static int __init bcachefs_init(void)
 	kobject_init(&bcachefs_kobj, &bcachefs_ktype);
 
 	if (kobject_add(&bcachefs_kobj, fs_kobj, "bcachefs") ||
+	    bch2_lock_graph_init() ||
 	    bch2_btree_key_cache_init() ||
 	    bch2_chardev_init() ||
 	    bch2_vfs_init() ||

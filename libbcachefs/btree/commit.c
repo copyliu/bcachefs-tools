@@ -518,12 +518,17 @@ static int run_one_mem_trigger(struct btree_trans *trans,
 	const struct bkey_ops *new_ops = bch2_bkey_type_ops(i->k->k.type);
 
 	if (old_ops->trigger == new_ops->trigger)
-		return bch2_key_trigger(trans, i->btree_id, i->level,
-				old, bkey_i_to_s(new),
-				BTREE_TRIGGER_insert|BTREE_TRIGGER_overwrite|flags);
+		return bch2_key_trigger(trans, (struct btree_trigger_op) {
+			.btree		= i->btree_id,
+			.level		= i->level,
+			.old		= old,
+			.new		= bkey_i_to_s(new),
+			.new_buf_u64s	= i->k_buf_u64s,
+			.flags		= BTREE_TRIGGER_insert|BTREE_TRIGGER_overwrite|flags,
+		});
 	else
 		return bch2_key_trigger_new(trans, i->btree_id, i->level,
-				bkey_i_to_s(new), flags) ?:
+				bkey_i_to_s(new), i->k_buf_u64s, flags) ?:
 		       bch2_key_trigger_old(trans, i->btree_id, i->level,
 				old, flags);
 }
@@ -552,15 +557,22 @@ static int run_one_trans_trigger(struct btree_trans *trans, struct btree_insert_
 	    old_ops->trigger == new_ops->trigger) {
 		i->overwrite_trigger_run = true;
 		i->insert_trigger_run = true;
-		return bch2_key_trigger(trans, i->btree_id, i->level, old, bkey_i_to_s(i->k),
-					BTREE_TRIGGER_insert|
-					BTREE_TRIGGER_overwrite|flags) ?: 1;
+		return bch2_key_trigger(trans, (struct btree_trigger_op) {
+			.btree		= i->btree_id,
+			.level		= i->level,
+			.old		= old,
+			.new		= bkey_i_to_s(i->k),
+			.new_buf_u64s	= i->k_buf_u64s,
+			.flags		= BTREE_TRIGGER_insert|
+					  BTREE_TRIGGER_overwrite|flags,
+		}) ?: 1;
 	} else if (!i->overwrite_trigger_run) {
 		i->overwrite_trigger_run = true;
 		return bch2_key_trigger_old(trans, i->btree_id, i->level, old, flags) ?: 1;
 	} else if (!i->insert_trigger_run) {
 		i->insert_trigger_run = true;
-		return bch2_key_trigger_new(trans, i->btree_id, i->level, bkey_i_to_s(i->k), flags) ?: 1;
+		return bch2_key_trigger_new(trans, i->btree_id, i->level, bkey_i_to_s(i->k),
+					    i->k_buf_u64s, flags) ?: 1;
 	} else {
 		return 0;
 	}
@@ -1151,8 +1163,9 @@ static noinline int bch2_trans_commit_btree_write_ratelimit(struct btree_trans *
 	struct bch_fs_btree_cache *bc = &trans->c->btree.cache;
 
 	return drop_locks_do(trans, ({
-		closure_wait_event(&bc->nr_in_flight_wait,
-				   atomic_long_read(&bc->nr_in_flight_inner) < BTREE_WRITE_IO_LIMIT(c) * 3 / 4);
+		trans_wait_event(trans, &bc->nr_in_flight_wait,
+			atomic_long_read(&bc->nr_in_flight_inner) < BTREE_WRITE_IO_LIMIT(c) * 3 / 4 &&
+			btree_cache_nr_dirty(bc) < btree_cache_nr_live(bc) * 3 / 4);
 		0;
 	}));
 }
@@ -1173,7 +1186,10 @@ int __bch2_trans_commit(struct btree_trans *trans, enum bch_trans_commit_flags f
 	if (!bch2_trans_has_updates(trans))
 		goto out_reset;
 
-	if (unlikely(atomic_long_read(&c->btree.cache.nr_in_flight_inner) > BTREE_WRITE_IO_LIMIT(c))) {
+	struct bch_fs_btree_cache *bc = &trans->c->btree.cache;
+	if ((flags & BCH_WATERMARK_MASK) <= BCH_WATERMARK_normal &&
+	    unlikely(atomic_long_read(&bc->nr_in_flight_inner) > BTREE_WRITE_IO_LIMIT(c) ||
+		     btree_cache_nr_dirty(bc) > btree_cache_nr_live(bc) * 4 / 5)) {
 		ret = bch2_trans_commit_btree_write_ratelimit(trans);
 		if (ret)
 			goto out_reset;

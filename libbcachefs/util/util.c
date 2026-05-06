@@ -23,6 +23,8 @@
 #include <linux/string.h>
 #include <linux/types.h>
 #include <linux/sched/clock.h>
+#include <linux/sched/debug.h>
+#include <linux/sched/signal.h>
 
 #include "eytzinger.h"
 #include "mean_and_variance.h"
@@ -1208,3 +1210,16 @@ void mempool_kvfree(void *element, void *pool_data)
 	kvfree(element);
 }
 #endif
+
+__sched int bch2_bit_wait_io_timeout(struct wait_bit_key *word, int mode)
+{
+	unsigned long now = jiffies;
+
+	if (time_after_eq(now, word->timeout))
+		return -EAGAIN;
+	io_schedule_timeout(word->timeout - now);
+	if (signal_pending_state(mode, current))
+		return -EINTR;
+
+	return 0;
+}

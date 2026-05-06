@@ -9,6 +9,7 @@
 #include "alloc/replicas_types.h"
 
 #include "btree/bbpos_types.h"
+#include "btree/bkey_types.h"
 #include "btree/interior_types.h"
 #include "btree/key_cache_types.h"
 #include "btree/node_scan_types.h"
@@ -265,6 +266,17 @@ struct bch_fs_btree_cache {
 	u64			pinned_nodes_mask[2];
 };
 
+static inline size_t btree_cache_nr_live(const struct bch_fs_btree_cache *bc)
+{
+	return btree_cache_list_nr(&bc->live[0]) +
+		btree_cache_list_nr(&bc->live[1]);
+}
+
+static inline size_t btree_cache_nr_dirty(const struct bch_fs_btree_cache *bc)
+{
+	return bc->live[0].nr_dirty + bc->live[1].nr_dirty;
+}
+
 /* Iterator, update, and trigger flags: */
 
 struct btree_node_iter {
@@ -353,6 +365,15 @@ enum btree_iter_update_trigger_flags {
 #define x(n) BTREE_TRIGGER_##n	= 1U << BTREE_ITER_FLAG_BIT_##n,
 	BTREE_TRIGGER_FLAGS()
 #undef x
+};
+
+struct btree_trigger_op {
+	enum btree_id				btree;
+	unsigned				level;
+	struct bkey_s_c				old;
+	struct bkey_s				new;
+	unsigned				new_buf_u64s;
+	enum btree_iter_update_trigger_flags	flags;
 };
 
 /* Btree paths and iterators: */
@@ -505,6 +526,7 @@ struct btree_insert_entry {
 	 * overwritten in the btree:
 	 */
 	u8			old_btree_u64s;
+	u8			k_buf_u64s;
 	btree_path_idx_t	path;
 	struct bkey_i		*k;
 	/* key being overwritten: */
@@ -688,7 +710,6 @@ struct bch_fs_btree_trans {
 	mempool_t			pool;
 	mempool_t			malloc_pool;
 	struct btree_trans_buf		__percpu *bufs;
-	struct lock_graph		__percpu *lock_graph;
 
 	struct srcu_struct		barrier;
 	bool				barrier_initialized;
