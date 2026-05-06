@@ -76,6 +76,20 @@ struct bch_percpu_free_run {
 };
 
 static DARRAY(struct bch_percpu_free_run) free_runs;
+
+/*
+ * Per-thread init callbacks for dynamically-allocated percpu vars
+ * (alloc_percpu()). Registered via bch2_alloc_percpu_init(); called for
+ * every existing thread chunk at registration time and for every future
+ * thread chunk at thread-create time.
+ */
+struct bch_percpu_dynamic_init {
+	void	*pcv;
+	void	(*init)(void *p, void *ctx, unsigned cpu);
+	void	*ctx;
+};
+
+static DARRAY(struct bch_percpu_dynamic_init) dynamic_inits;
 static size_t		dynamic_used;
 /*
  * Map from grain index to allocation size in grains, so free_percpu()
@@ -140,6 +154,29 @@ void bch_percpu_thread_init(void)
 	for (int i = 0; i < nr_callbacks; i++)
 		if (callbacks[i].init_one)
 			callbacks[i].init_one(__bch_percpu_resolve(callbacks[i].pcv, chunk));
+
+	darray_for_each(dynamic_inits, di)
+		di->init(__bch_percpu_resolve(di->pcv, chunk), di->ctx, my_id);
+
+	pthread_mutex_unlock(&bch_percpu_lock);
+}
+
+void __bch2_alloc_percpu_init(void *pcv,
+			      void (*init)(void *p, void *ctx, unsigned cpu),
+			      void *ctx)
+{
+	pthread_mutex_lock(&bch_percpu_lock);
+
+	for (int cpu = 0; cpu < bch_percpu_nr_cpus; cpu++)
+		if (bch_percpu_chunks[cpu])
+			init(__bch_percpu_resolve(pcv, bch_percpu_chunks[cpu]), ctx, cpu);
+
+	if (darray_push(&dynamic_inits,
+			((struct bch_percpu_dynamic_init){pcv, init, ctx}))) {
+		pthread_mutex_unlock(&bch_percpu_lock);
+		fprintf(stderr, "bch2_alloc_percpu_init: out of memory registering init\n");
+		abort();
+	}
 
 	pthread_mutex_unlock(&bch_percpu_lock);
 }
@@ -262,5 +299,6 @@ static void bch_percpu_module_exit(void)
 		bch_percpu_chunks[cpu] = NULL;
 	}
 	darray_exit(&free_runs);
+	darray_exit(&dynamic_inits);
 	pthread_mutex_unlock(&bch_percpu_lock);
 }
