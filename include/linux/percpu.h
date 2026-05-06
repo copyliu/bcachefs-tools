@@ -227,16 +227,24 @@ do {									\
 #define __this_cpu_inc_return(pcp)	__this_cpu_add_return(pcp, 1)
 #define __this_cpu_dec_return(pcp)	__this_cpu_add_return(pcp, -1)
 
-#define this_cpu_read(pcp)		((pcp))
-#define this_cpu_write(pcp, val)	((pcp) = val)
-#define this_cpu_add(pcp, val)		((pcp) += val)
-#define this_cpu_and(pcp, val)		((pcp) &= val)
-#define this_cpu_or(pcp, val)		((pcp) |= val)
-#define this_cpu_add_return(pcp, val)	((pcp) += val)
+/*
+ * pcp is an lvalue at a percpu address (a DEFINE_PER_CPU variable, or
+ * arr[i] where arr came from alloc_percpu). Take its address, resolve
+ * it to a real pointer in the current thread's chunk, and operate on
+ * that. Direct lvalue ops on pcp would dereference the small offset
+ * for alloc_percpu()'d memory and segfault.
+ */
+#define this_cpu_read(pcp)		(*this_cpu_ptr(&(pcp)))
+#define this_cpu_write(pcp, val)	(*this_cpu_ptr(&(pcp)) = (val))
+#define this_cpu_add(pcp, val)		(*this_cpu_ptr(&(pcp)) += (val))
+#define this_cpu_and(pcp, val)		(*this_cpu_ptr(&(pcp)) &= (val))
+#define this_cpu_or(pcp, val)		(*this_cpu_ptr(&(pcp)) |= (val))
+#define this_cpu_add_return(pcp, val)	(*this_cpu_ptr(&(pcp)) += (val))
 #define this_cpu_xchg(pcp, nval)					\
 ({									\
-	typeof(pcp) _r = (pcp);						\
-	(pcp) = (nval);							\
+	typeof(pcp) *_p = this_cpu_ptr(&(pcp));				\
+	typeof(pcp) _r = *_p;						\
+	*_p = (nval);							\
 	_r;								\
 })
 
