@@ -49,16 +49,13 @@ fn cmd_reset_counters(cli: Cli) -> Result<()> {
         .context("opening filesystem")?;
 
     unsafe {
-        let now = (*fs.raw).counters.now;
-
-        // zero counters (percpu is just a plain pointer in userspace)
         if to_reset.is_empty() {
             for i in 0..BCH_COUNTER_NR as usize {
-                *now.add(i) = 0;
+                c::bch2_counter_reset(fs.raw, i as u32);
             }
         } else {
             for &i in &to_reset {
-                *now.add(i) = 0;
+                c::bch2_counter_reset(fs.raw, i as u32);
             }
         }
 
