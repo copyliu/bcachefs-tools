@@ -243,6 +243,7 @@ fn cmd_fsck(cli: FsckCli) -> Result<()> {
         "fsck".into(),
         "fix_errors=ask".into(),
         "read_only".into(),
+        "noreconcile_enabled".into(),
     ];
 
     if cli.yes {
