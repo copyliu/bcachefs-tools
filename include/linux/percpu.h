@@ -1,14 +1,17 @@
 #ifndef __TOOLS_LINUX_PERCPU_H
 #define __TOOLS_LINUX_PERCPU_H
 
+#include <stddef.h>
+#include <stdint.h>
 #include <linux/cpumask.h>
+#include <linux/kernel.h>
+#include <linux/types.h>
 
 #define __percpu
 
-#define free_percpu(percpu)				free(percpu)
-
-#define __alloc_percpu_gfp(size, align, gfp)		calloc(1, size)
-#define __alloc_percpu(size, align)			calloc(1, size)
+void *__alloc_percpu_gfp(size_t size, size_t align, gfp_t gfp);
+void *__alloc_percpu(size_t size, size_t align);
+void  free_percpu(void *p);
 
 #define alloc_percpu_gfp(type, gfp)					\
 	(typeof(type) __percpu *)__alloc_percpu_gfp(sizeof(type),	\
@@ -39,21 +42,41 @@ extern char __start_bch_percpu[], __stop_bch_percpu[];
 
 #define BCH_PERCPU_MAX_CPUS	256
 
+/*
+ * Per-thread chunk layout: [static_section][dynamic_arena].
+ *
+ * Static section is sized at link time (__stop_bch_percpu - __start_bch_percpu);
+ * dynamic arena is BCH_PERCPU_DYNAMIC_SIZE bytes for alloc_percpu().
+ */
+#define BCH_PERCPU_DYNAMIC_SIZE	(64 * 1024)
+
 extern __thread void *bch_percpu_my_chunk;
 extern __thread int   bch_percpu_my_id;
 extern void *bch_percpu_chunks[BCH_PERCPU_MAX_CPUS];
 extern int   bch_percpu_nr_cpus;
+extern size_t bch_percpu_static_size;
 
 void bch_percpu_thread_init(void);
 void bch_percpu_register(void (*init_one)(void *), void (*exit_one)(void *),
 			 void *pcv);
 
+/*
+ * A percpu pointer is one of:
+ *   - the address of a DEFINE_PER_CPU variable (lives in [__start_bch_percpu,
+ *     __stop_bch_percpu) — real virtual address, well above any small offset)
+ *   - an offset in [static_size, static_size + BCH_PERCPU_DYNAMIC_SIZE)
+ *     returned by alloc_percpu()
+ *
+ * static section addresses are >= __start_bch_percpu (a real VA, megabytes+);
+ * dynamic offsets are small (under chunk size). The threshold check
+ * distinguishes them.
+ */
 static inline void *__bch_percpu_resolve(void *p, void *chunk)
 {
-	char *cp = (char *)p;
-	if (cp >= __start_bch_percpu && cp < __stop_bch_percpu)
-		return (char *)chunk + (cp - __start_bch_percpu);
-	return p;	/* alloc_percpu pass-through */
+	uintptr_t v = (uintptr_t)p;
+	if (v < bch_percpu_static_size + BCH_PERCPU_DYNAMIC_SIZE)
+		return (char *)chunk + v;	/* dynamic offset */
+	return (char *)chunk + ((char *)p - __start_bch_percpu); /* static section */
 }
 
 #define this_cpu_ptr(ptr)						\
