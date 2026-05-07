@@ -538,6 +538,72 @@ static noinline void bucket_alloc_to_text(struct printbuf *out,
 		prt_printf(out, "err\t%s\n", bch2_err_str(PTR_ERR(ob)));
 }
 
+/*
+ * Replicas can only fit across a device set when no single device exceeds
+ * 1/N of the total capacity: a block on the largest device needs N-1 copies
+ * elsewhere, and those copies must fit in (total - max). So
+ * (N-1)*max <= total - max, i.e. N*max <= total.
+ *
+ * When this is violated for the rw device set the request is allowed to
+ * write to (after data_type filtering), no amount of waiting or copygc
+ * fixes it; the request must degrade to fewer replicas or fail.
+ */
+static bool req_dev_sizes_mismatched(struct bch_fs *c, struct alloc_request *req)
+{
+	if (req->nr_replicas <= 1)
+		return false;
+
+	u64 total = 0, max = 0;
+
+	guard(rcu)();
+	for_each_rw_member_rcu(c, ca) {
+		if (!(ca->mi.data_allowed & BIT(req->data_type)))
+			continue;
+		total += ca->mi.nbuckets;
+		max = max(max, ca->mi.nbuckets);
+	}
+
+	return max > (total - max);
+}
+
+/*
+ * Decide whether an alloc that came up empty-handed on the current candidate
+ * device should bail (committing the request with whatever replicas it
+ * already has) instead of waiting on freelist_wait. Bails iff the request
+ * has at least one replica's worth to commit AND any of:
+ *
+ *  - copygc_can_make_progress is false: the per-device check (set above by
+ *    the caller from bch2_copygc_can_make_progress(ca)) says copygc can't
+ *    free buckets here. No reason to wait — copygc isn't going to help.
+ *
+ *  - watermark == copygc and data_type != btree: the request itself is
+ *    issued at copygc watermark, i.e. it IS the thing trying to free
+ *    buckets. Blocking it on freelist_wait would deadlock the freer against
+ *    its own progress signal. Btree node writes are excluded from this
+ *    carve-out: they may inherit copygc watermark for priority, but they
+ *    must not commit under-replicated (a single-ptr btree node on a failing
+ *    device → btree_node_write_all_failed → emergency_ro).
+ *
+ *  - req_dev_sizes_mismatched: the rw device topology can't satisfy
+ *    nr_replicas regardless of how much waiting or copygc happens (e.g.
+ *    after a device remove leaves max(devs) > sum(rest)). See helper above.
+ *
+ * If none of these fire and we have a closure to wait on, we register on
+ * freelist_wait and retry once the wake counter advances.
+ */
+static bool req_alloc_should_bail(struct bch_fs *c, struct alloc_request *req)
+{
+	bool have_replicas = req->nr_effective ||
+		(req->devs_have && req->devs_have->nr);
+	if (!have_replicas)
+		return false;
+
+	return !req->copygc_can_make_progress ||
+	       (req->watermark == BCH_WATERMARK_copygc &&
+		req->data_type != BCH_DATA_btree) ||
+	       req_dev_sizes_mismatched(c, req);
+}
+
 /**
  * bch2_bucket_alloc_trans - allocate a single bucket from a specific device
  * @trans:	transaction object
@@ -588,9 +654,7 @@ again:
 		    !req->will_retry_target_devices &&
 		    !req->will_retry_all_devices &&
 		    !req->will_retry_set_devices) {
-			if ((!req->copygc_can_make_progress ||
-			     req->watermark == BCH_WATERMARK_copygc) &&
-			    (req->nr_effective || (req->devs_have && req->devs_have->nr))) {
+			if (req_alloc_should_bail(c, req)) {
 				ob = ERR_PTR(bch_err_throw(c, bucket_alloc_no_progress));
 			} else if (!waiting) {
 				closure_wait(&c->allocator.freelist_wait, req->cl);
