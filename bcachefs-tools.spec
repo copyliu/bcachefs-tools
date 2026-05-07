@@ -93,6 +93,7 @@ BuildRequires:  pkgconfig(libkeyutils)
 BuildRequires:  pkgconfig(liblz4)
 BuildRequires:  pkgconfig(libsodium)
 BuildRequires:  pkgconfig(libudev)
+BuildRequires:  pkgconfig(libunwind)
 BuildRequires:  pkgconfig(liburcu) >= 0.15
 BuildRequires:  pkgconfig(libzstd)
 BuildRequires:  pkgconfig(udev)
