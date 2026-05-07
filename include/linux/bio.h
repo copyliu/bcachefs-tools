@@ -206,6 +206,10 @@ static inline void bioset_free(struct bio_set *bs)
 void bioset_exit(struct bio_set *);
 int bioset_init(struct bio_set *, unsigned, unsigned, int);
 
+extern struct bio_set fs_bio_set;
+
+#define BIO_POOL_SIZE 2
+
 extern struct bio_set *bioset_create(unsigned int, unsigned int);
 extern struct bio_set *bioset_create_nobvec(unsigned int, unsigned int);
 enum {
