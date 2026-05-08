@@ -20,9 +20,9 @@ static inline unsigned btree_ptr_sectors_written(struct bkey_s_c k)
 
 struct btree_read_bio {
 	struct bch_fs		*c;
+	struct bch_dev		*ca;	/* stashed at submit; see bch_write_bio */
 	struct btree		*b;
 	u64			start_time;
-	unsigned		have_ioref:1;
 	unsigned		idx:7;
 #ifdef CONFIG_BCACHEFS_ASYNC_OBJECT_LISTS
 	unsigned		list_idx;
