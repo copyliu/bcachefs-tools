@@ -57,11 +57,17 @@ static void bt_signal_handler(int sig)
 	while (skip-- && unw_step(&cursor) > 0)
 		;
 
-	while (n < r->size && unw_step(&cursor) > 0) {
+	/*
+	 * Capture-then-step: after init_local + skips, the cursor points at
+	 * the topmost frame the caller wanted. That frame's IP is _THIS_IP_
+	 * for the original bch2_save_backtrace() call site; stepping before
+	 * reading would drop it.
+	 */
+	do {
 		if (unw_get_reg(&cursor, UNW_REG_IP, &ip) < 0)
 			break;
 		r->store[n++] = (unsigned long)ip;
-	}
+	} while (n < r->size && unw_step(&cursor) > 0);
 
 done:
 	r->nr_captured = n;
@@ -109,11 +115,11 @@ unsigned int stack_trace_save_tsk(struct task_struct *task,
 		while (skip-- && unw_step(&cursor) > 0)
 			;
 
-		while (n < size && unw_step(&cursor) > 0) {
+		do {
 			if (unw_get_reg(&cursor, UNW_REG_IP, &ip) < 0)
 				break;
 			store[n++] = (unsigned long)ip;
-		}
+		} while (n < size && unw_step(&cursor) > 0);
 		return n;
 	}
 
