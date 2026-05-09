@@ -73,14 +73,28 @@ void bch_percpu_register(void (*init_one)(void *), void (*exit_one)(void *),
  */
 static inline void *__bch_percpu_resolve(void *p, void *chunk)
 {
+	BUG_ON(!chunk);
 	uintptr_t v = (uintptr_t)p;
 	if (v < bch_percpu_static_size + BCH_PERCPU_DYNAMIC_SIZE)
 		return (char *)chunk + v;	/* dynamic offset */
 	return (char *)chunk + ((char *)p - __start_bch_percpu); /* static section */
 }
 
+/*
+ * Lazy-init: any thread that takes a percpu pointer gets a chunk on first
+ * access. Avoids having to remember to call bch_percpu_thread_init() at
+ * the entry point of every thread that might reach libbcachefs — Rust-
+ * spawned threads (tiny_http workers, fuse workers, std::thread closures
+ * we don't directly own) won't hit a NULL chunk and silently corrupt /
+ * SIGSEGV. The cold path is a tail call into thread_init; the hot path
+ * is the same single load + branch as before.
+ */
 #define this_cpu_ptr(ptr)						\
-	((typeof(ptr))__bch_percpu_resolve((void *)(ptr), bch_percpu_my_chunk))
+({									\
+	if (unlikely(!bch_percpu_my_chunk))				\
+		bch_percpu_thread_init();				\
+	(typeof(ptr))__bch_percpu_resolve((void *)(ptr), bch_percpu_my_chunk); \
+})
 
 #define per_cpu_ptr(ptr, cpu)						\
 	((typeof(ptr))__bch_percpu_resolve((void *)(ptr), bch_percpu_chunks[cpu]))
