@@ -47,7 +47,7 @@ static int worker_thread(void *arg)
 
 	pthread_mutex_lock(&wq_lock);
 	while (1) {
-		__set_current_state(TASK_INTERRUPTIBLE);
+		set_current_state(TASK_INTERRUPTIBLE);
 		work = list_first_entry_or_null(&wq->pending_work,
 				struct work_struct, entry);
 		wq->current_work = work;
@@ -63,6 +63,7 @@ static int worker_thread(void *arg)
 			pthread_mutex_lock(&wq_lock);
 			continue;
 		}
+		__set_current_state(TASK_RUNNING);
 
 		BUG_ON(!work_pending(work));
 		list_del_init(&work->entry);
