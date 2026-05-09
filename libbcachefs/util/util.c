@@ -303,10 +303,126 @@ int bch2_save_backtrace(bch_stacktrace *stack, struct task_struct *task, unsigne
 #endif
 }
 
+#ifndef __KERNEL__
+#define UNW_LOCAL_ONLY
+#include <libunwind.h>
+#include <dlfcn.h>
+#include <pthread.h>
+#include <unistd.h>
+
+size_t bch2_demangle(const char *mangled, char *out, size_t out_len);
+
+/* libdw / libdwfl, dlopened lazily — file:line is best-effort. */
+struct Dwfl;
+struct Dwfl_Module;
+struct Dwfl_Line;
+
+struct dwfl_callbacks {
+	int  (*find_elf)(struct Dwfl_Module *, void **, const char *,
+			 unsigned long, char **, void **);
+	int  (*find_debuginfo)(struct Dwfl_Module *, void **, const char *,
+			       unsigned long, const char *, const char *,
+			       unsigned long, char **);
+	int  (*section_address)(struct Dwfl_Module *, void **, const char *,
+				unsigned long, const char *, unsigned long,
+				const void *, unsigned long *);
+	char **debuginfo_path;
+};
+
+static struct {
+	bool			initialized;
+	struct Dwfl		*dwfl;
+	struct Dwfl_Module	*(*addrmodule)(struct Dwfl *, unsigned long);
+	struct Dwfl_Line	*(*module_getsrc)(struct Dwfl_Module *, unsigned long);
+	const char		*(*lineinfo)(struct Dwfl_Line *, unsigned long *,
+					     int *, int *, void *, void *);
+} dw;
+
+static pthread_once_t dw_once = PTHREAD_ONCE_INIT;
+
+static void dw_init(void)
+{
+	void *h = dlopen("libdw.so.1", RTLD_LAZY);
+	if (!h)
+		return;
+
+	struct Dwfl		*(*dwfl_begin)(const struct dwfl_callbacks *);
+	int			(*dwfl_linux_proc_report)(struct Dwfl *, pid_t);
+	int			(*dwfl_report_end)(struct Dwfl *,
+				int (*)(struct Dwfl_Module *, void *,
+					const char *, unsigned long, void *),
+				void *);
+	int			(*find_elf)();
+	int			(*find_debuginfo)();
+
+	dwfl_begin		= dlsym(h, "dwfl_begin");
+	dwfl_linux_proc_report	= dlsym(h, "dwfl_linux_proc_report");
+	dwfl_report_end		= dlsym(h, "dwfl_report_end");
+	find_elf		= dlsym(h, "dwfl_linux_proc_find_elf");
+	find_debuginfo		= dlsym(h, "dwfl_standard_find_debuginfo");
+	dw.addrmodule		= dlsym(h, "dwfl_addrmodule");
+	dw.module_getsrc	= dlsym(h, "dwfl_module_getsrc");
+	dw.lineinfo		= dlsym(h, "dwfl_lineinfo");
+
+	if (!dwfl_begin || !dwfl_linux_proc_report || !dwfl_report_end ||
+	    !find_elf || !find_debuginfo ||
+	    !dw.addrmodule || !dw.module_getsrc || !dw.lineinfo)
+		return;
+
+	static struct dwfl_callbacks cb;
+	cb.find_elf		= (void *) find_elf;
+	cb.find_debuginfo	= (void *) find_debuginfo;
+
+	dw.dwfl = dwfl_begin(&cb);
+	if (!dw.dwfl)
+		return;
+
+	if (dwfl_linux_proc_report(dw.dwfl, getpid()) ||
+	    dwfl_report_end(dw.dwfl, NULL, NULL))
+		return;
+
+	dw.initialized = true;
+}
+
+static const char *dw_addr_to_src(unsigned long addr, int *lineno)
+{
+	pthread_once(&dw_once, dw_init);
+	if (!dw.initialized)
+		return NULL;
+
+	struct Dwfl_Module *mod = dw.addrmodule(dw.dwfl, addr);
+	if (!mod)
+		return NULL;
+	struct Dwfl_Line *line = dw.module_getsrc(mod, addr);
+	if (!line)
+		return NULL;
+	return dw.lineinfo(line, NULL, lineno, NULL, NULL, NULL);
+}
+#endif
+
 void bch2_prt_backtrace(struct printbuf *out, bch_stacktrace *stack)
 {
 	darray_for_each(*stack, i) {
+#ifdef __KERNEL__
 		prt_printf(out, "[<0>] %pB", (void *) *i);
+#else
+		char name[256], demangled[512];
+		unw_word_t off;
+		int err = unw_get_proc_name_by_ip(unw_local_addr_space, *i,
+						  name, sizeof(name), &off, NULL);
+		if (!err) {
+			size_t n = bch2_demangle(name, demangled, sizeof(demangled));
+			prt_printf(out, "[<0>] %s+0x%lx",
+				   n ? demangled : name, (unsigned long) off);
+		} else {
+			prt_printf(out, "[<0>] 0x%lx", *i);
+		}
+
+		int lineno = 0;
+		const char *src = dw_addr_to_src(*i, &lineno);
+		if (src)
+			prt_printf(out, " %s:%d", src, lineno);
+#endif
 		prt_newline(out);
 	}
 }
