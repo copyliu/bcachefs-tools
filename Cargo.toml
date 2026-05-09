@@ -50,6 +50,11 @@ default-features = false
 [profile.release]
 #strip = "debuginfo"
 debug = 2
+# panic = abort makes catch_unwind a no-op, so a panic from libbcachefs (or a
+# fault converted to one by libstd's signal handling) can't be swallowed by a
+# downstream catch_unwind — it always aborts. The C SIGABRT handler then
+# prints the unified backtrace.
+panic = "abort"
 
 [package.metadata.vendor-filter]
 platforms = ["*-linux-*"]

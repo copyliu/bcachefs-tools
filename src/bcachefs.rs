@@ -259,6 +259,12 @@ fn generate_cli_doc() -> ExitCode {
 }
 
 fn main() -> ExitCode {
+    // panic = "abort" in Cargo.toml ensures Rust panics can't be swallowed
+    // by catch_unwind; this installs C-side handlers for SIGABRT/SIGSEGV/
+    // SIGILL/SIGBUS/SIGFPE so a panic or fatal fault prints a unified
+    // backtrace via bch2_prt_task_backtrace before the kernel core-dumps.
+    unsafe { c::bch2_install_fatal_signal_handlers(); }
+
     // glibc and Rust stdlib buffer stdout independently; when piped, both
     // switch to block buffering which can reorder or lose output.
     // Set both to line-buffered.
