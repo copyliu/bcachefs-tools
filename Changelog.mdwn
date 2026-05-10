@@ -1,5 +1,38 @@
 # Changelog
 
+## v1.38.3 - Sun May 10 2026
+
+Maintenance release on top of v1.38.2. No on-disk format changes.
+
+### Erasure coding: in-place stripe widening
+
+Stripes can now widen — adding data blocks when more devices become
+available — without a full re-encode. New `bch_stripe.can_widen` field
+tracks eligibility; reconcile-scan refreshes it on existing stripes,
+and a fresh fsck check ensures it stays consistent. Previously the
+only way to grow stripe width was to write new data into a wider
+stripe and let the old one age out via copygc.
+
+### Performance
+
+- 3:2 btree node merging: btree node occupancy roughly doubles, and a cache for
+  utilization of evicted btree nodes - btree node merge attempts no longer
+  thrash the btree node cache.
+- `__bch2_bkey_unpack_key` is now significantly faster, using precomputed format
+  constants.
+- Per-btree btree write buffer flushing is now properly multithreaded, and out
+  of the journal reclaim thread.
+- With reconcile now generating much heavier metadata workloads, we now have
+  ratelimiting for btree node cache utilization and IO pressure, addressing OOM
+  issues on some fileserver workloads. This will in the future be rolled into
+  the generalized backpressure subsystem; we'll be watching to see how this
+  affects performance.
+
+### Bug fixes
+
+Many - the full test suite in the CI is now down to 15-20 failures per run, out
+of 13k tests.
+
 ## v1.38.2 - Sat May 2 2026
 
 ### Build fix
