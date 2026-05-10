@@ -134,6 +134,7 @@ check, modify and correct any inconsistencies in the bcachefs filesystem.
 %{_sbindir}/mount.fuse.bcachefs
 %{_sbindir}/fsck.fuse.bcachefs
 %{_sbindir}/mkfs.fuse.bcachefs
+%{_unitdir}/bcachefs-wait-devices@.service
 
 %package -n %{dkmsname}
 Summary:        Bcachefs kernel module managed by DKMS
